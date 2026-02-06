@@ -1,0 +1,14 @@
+name: Make subtitles STT
+
+on:
+  repository_dispatch:
+    types: [make_subs_stt]
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping
+        run: |
+          echo "Triggered OK"
+          echo '${{ toJson(github.event.client_payload) }}'
