@@ -5,26 +5,215 @@ on:
     types: [make_subs_stt]
 
 jobs:
-  r2_test:
+  make_subs:
     runs-on: ubuntu-latest
-    steps:
-      - name: Show payload
-        run: |
-          echo "Triggered OK"
-          echo '${{ toJson(github.event.client_payload) }}'
+    timeout-minutes: 45
 
-      - name: Install awscli
+    steps:
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y awscli
+          sudo apt-get install -y ffmpeg awscli python3-pip
 
-      - name: R2 list bucket (TEST)
+      - name: Setup env
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$R2_BUCKET"
+          echo "R2 endpoint: $R2_ENDPOINT"
+          echo "ok" > /tmp/ok
 
+      - name: Download inputs from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ github.event.client_payload.bucket }}
+          VIDEO_KEY: ${{ github.event.client_payload.video_key }}
+          AUDIO_KEY: ${{ github.event.client_payload.audio_key }}
+        run: |
+          set -e
+          if [ -z "$BUCKET" ] || [ -z "$VIDEO_KEY" ]; then
+            echo "Missing bucket or video_key in payload"
+            exit 1
+          fi
+
+          echo "Downloading video: s3://$BUCKET/$VIDEO_KEY"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$VIDEO_KEY" ./video.mp4
+
+          if [ -n "$AUDIO_KEY" ]; then
+            echo "Downloading audio: s3://$BUCKET/$AUDIO_KEY"
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$AUDIO_KEY" ./audio_in
+          else
+            echo "No audio_key provided, extracting audio from video..."
+            ffmpeg -y -i ./video.mp4 -vn -ac 1 -ar 16000 -f wav ./audio.wav
+          fi
+
+          if [ -n "$AUDIO_KEY" ]; then
+            # Normalize any input audio to 16k mono wav for STT
+            ffmpeg -y -i ./audio_in -ac 1 -ar 16000 -f wav ./audio.wav
+          fi
+
+          ls -lh
+
+      - name: Install faster-whisper
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install faster-whisper==1.0.3
+
+      - name: Transcribe + build ASS (per-word) + SRT
+        env:
+          LANG_CODE: en
+        run: |
+          cat > make_subs.py <<'PY'
+          import os, math, re
+          from faster_whisper import WhisperModel
+
+          AUDIO = "audio.wav"
+          OUT_SRT = "subs.srt"
+          OUT_ASS = "subs.ass"
+
+          lang = os.environ.get("LANG_CODE", "en")
+
+          # Model choice: medium is better but slower. small is faster.
+          # Change to "medium" if you want better quality.
+          model_name = os.environ.get("WHISPER_MODEL", "small")
+
+          model = WhisperModel(model_name, device="cpu", compute_type="int8")
+
+          segments, info = model.transcribe(
+              AUDIO,
+              language=lang,
+              vad_filter=True,
+              word_timestamps=True
+          )
+
+          def srt_ts(t: float) -> str:
+              if t < 0: t = 0
+              ms = int(round(t * 1000.0))
+              h = ms // 3600000; ms %= 3600000
+              m = ms // 60000;   ms %= 60000
+              s = ms // 1000;    ms %= 1000
+              return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+          # Simple cleaning (optional)
+          def clean_text(s: str) -> str:
+              s = re.sub(r"\s+", " ", s).strip()
+              return s
+
+          # Write SRT by segments
+          srt_lines = []
+          idx = 1
+
+          # Build ASS with karaoke per-word (each segment becomes one line)
+          # You can tweak style here: font size, position, outline etc.
+          ass_header = r"""[Script Info]
+          ScriptType: v4.00+
+          PlayResX: 1080
+          PlayResY: 1920
+          WrapStyle: 0
+          ScaledBorderAndShadow: yes
+
+          [V4+ Styles]
+          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+          Style: Default,Arial,88,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,1,0,0,0,100,100,0,0,1,6,2,2,50,50,220,1
+
+          [Events]
+          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+          """
+          def ass_ts(t: float) -> str:
+              # h:mm:ss.cc
+              if t < 0: t = 0
+              cs = int(round(t * 100))  # centiseconds
+              h = cs // 360000; cs %= 360000
+              m = cs // 6000;   cs %= 6000
+              s = cs // 100;    cs %= 100
+              return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+          ass_lines = [ass_header]
+
+          for seg in segments:
+              start = float(seg.start)
+              end = float(seg.end)
+              text = clean_text(seg.text or "")
+              if not text:
+                  continue
+
+              srt_lines.append(str(idx))
+              srt_lines.append(f"{srt_ts(start)} --> {srt_ts(end)}")
+              srt_lines.append(text)
+              srt_lines.append("")
+              idx += 1
+
+              # karaoke per word
+              words = []
+              if getattr(seg, "words", None):
+                  words = seg.words
+
+              if not words:
+                  # fallback: show plain text
+                  ass_text = text.replace("{", "(").replace("}", ")")
+                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{ass_text}")
+                  continue
+
+              # build \k tags in centiseconds
+              parts = []
+              for w in words:
+                  ws = float(w.start); we = float(w.end)
+                  dur_cs = max(1, int(round((we - ws) * 100)))
+                  token = (w.word or "").strip()
+                  if not token:
+                      continue
+                  token = token.replace("{", "(").replace("}", ")")
+                  parts.append(rf"{{\k{dur_cs}}}{token}")
+
+              if not parts:
+                  ass_text = text.replace("{", "(").replace("}", ")")
+                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{ass_text}")
+                  continue
+
+              ass_text = " ".join(parts)
+              ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{ass_text}")
+
+          with open(OUT_SRT, "w", encoding="utf-8") as f:
+              f.write("\n".join(srt_lines))
+
+          with open(OUT_ASS, "w", encoding="utf-8") as f:
+              f.write("\n".join(ass_lines))
+
+          print("Wrote:", OUT_SRT, OUT_ASS)
+          PY
+
+          python3 make_subs.py
+          ls -lh subs.srt subs.ass
+
+      - name: Burn ASS subtitles into video (vertical 1080x1920)
+        run: |
+          # If your video is already correct size, it will just overlay.
+          # If you need to enforce size, uncomment scale/pad filter.
+          ffmpeg -y -i video.mp4 -vf "ass=subs.ass" -c:a copy out_subbed.mp4
+          ls -lh out_subbed.mp4
+
+      - name: Upload results to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ github.event.client_payload.bucket }}
+          VIDEO_ID: ${{ github.event.client_payload.video_id }}
+        run: |
+          set -e
+          if [ -z "$VIDEO_ID" ]; then VIDEO_ID="unknown"; fi
+
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp ./subs.srt "s3://$BUCKET/subs/${VIDEO_ID}.srt"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp ./subs.ass "s3://$BUCKET/subs/${VIDEO_ID}.ass"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp ./out_subbed.mp4 "s3://$BUCKET/final/${VIDEO_ID}_subbed.mp4"
+
+          echo "Uploaded:"
+          echo "subs/${VIDEO_ID}.srt"
+          echo "subs/${VIDEO_ID}.ass"
+          echo "final/${VIDEO_ID}_subbed.mp4"
