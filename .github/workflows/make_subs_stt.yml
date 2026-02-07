@@ -10,31 +10,37 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install system deps
         shell: bash
         run: |
-         set -euo pipefail
-         sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
-         sudo dpkg --configure -a || true
+          set -euo pipefail
+          sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
+          sudo dpkg --configure -a || true
 
-         sudo apt-get -o Acquire::Retries=5 update
-         sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-          ffmpeg \
-          python3 python3-pip
-
-
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+            ffmpeg \
+            python3 python3-pip \
+            jq
 
       - name: Setup env
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
+          set -euo pipefail
           echo "R2 endpoint: $R2_ENDPOINT"
-          echo "ok" > /tmp/ok
+          echo "Triggered payload:"
+          echo '${{ toJson(github.event.client_payload) }}'
 
-      - name: Download inputs from R2
+      - name: Download inputs from R2 (with debug ls)
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -44,41 +50,60 @@ jobs:
           VIDEO_KEY: ${{ github.event.client_payload.video_key }}
           AUDIO_KEY: ${{ github.event.client_payload.audio_key }}
         run: |
-          set -e
-          if [ -z "$BUCKET" ] || [ -z "$VIDEO_KEY" ]; then
-            echo "Missing bucket or video_key in payload"
+          set -euo pipefail
+
+          if [ -z "${BUCKET:-}" ]; then
+            echo "Missing bucket in payload"
+            exit 1
+          fi
+
+          echo "==== DEBUG: list bucket root (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/" | head -n 100 || true
+
+          echo "==== DEBUG: list videos/ (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/videos/" | head -n 100 || true
+
+          echo "==== DEBUG: list audios/ (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/audios/" | head -n 100 || true
+
+          if [ -z "${VIDEO_KEY:-}" ]; then
+            echo "Missing video_key in payload"
             exit 1
           fi
 
           echo "Downloading video: s3://$BUCKET/$VIDEO_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$VIDEO_KEY" ./video.mp4
 
-          if [ -n "$AUDIO_KEY" ]; then
+          if [ -n "${AUDIO_KEY:-}" ]; then
             echo "Downloading audio: s3://$BUCKET/$AUDIO_KEY"
             aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$AUDIO_KEY" ./audio_in
+            echo "Normalizing audio -> 16k mono wav"
+            ffmpeg -y -i ./audio_in -ac 1 -ar 16000 -f wav ./audio.wav
           else
             echo "No audio_key provided, extracting audio from video..."
             ffmpeg -y -i ./video.mp4 -vn -ac 1 -ar 16000 -f wav ./audio.wav
           fi
 
-          if [ -n "$AUDIO_KEY" ]; then
-            # Normalize any input audio to 16k mono wav for STT
-            ffmpeg -y -i ./audio_in -ac 1 -ar 16000 -f wav ./audio.wav
-          fi
-
+          echo "Downloaded files:"
           ls -lh
 
       - name: Install faster-whisper
+        shell: bash
         run: |
+          set -euo pipefail
           python3 -m pip install --upgrade pip
           pip install faster-whisper==1.0.3
 
       - name: Transcribe + build ASS (per-word) + SRT
+        shell: bash
         env:
           LANG_CODE: en
+          WHISPER_MODEL: small
         run: |
+          set -euo pipefail
+
           cat > make_subs.py <<'PY'
-          import os, math, re
+          import os, re
           from faster_whisper import WhisperModel
 
           AUDIO = "audio.wav"
@@ -86,9 +111,6 @@ jobs:
           OUT_ASS = "subs.ass"
 
           lang = os.environ.get("LANG_CODE", "en")
-
-          # Model choice: medium is better but slower. small is faster.
-          # Change to "medium" if you want better quality.
           model_name = os.environ.get("WHISPER_MODEL", "small")
 
           model = WhisperModel(model_name, device="cpu", compute_type="int8")
@@ -108,17 +130,9 @@ jobs:
               s = ms // 1000;    ms %= 1000
               return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-          # Simple cleaning (optional)
           def clean_text(s: str) -> str:
-              s = re.sub(r"\s+", " ", s).strip()
-              return s
+              return re.sub(r"\s+", " ", (s or "")).strip()
 
-          # Write SRT by segments
-          srt_lines = []
-          idx = 1
-
-          # Build ASS with karaoke per-word (each segment becomes one line)
-          # You can tweak style here: font size, position, outline etc.
           ass_header = r"""[Script Info]
           ScriptType: v4.00+
           PlayResX: 1080
@@ -133,8 +147,8 @@ jobs:
           [Events]
           Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
           """
+
           def ass_ts(t: float) -> str:
-              # h:mm:ss.cc
               if t < 0: t = 0
               cs = int(round(t * 100))  # centiseconds
               h = cs // 360000; cs %= 360000
@@ -142,33 +156,31 @@ jobs:
               s = cs // 100;    cs %= 100
               return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
+          srt_lines = []
           ass_lines = [ass_header]
+          idx = 1
 
           for seg in segments:
               start = float(seg.start)
               end = float(seg.end)
-              text = clean_text(seg.text or "")
+              text = clean_text(seg.text)
               if not text:
                   continue
 
+              # SRT by segments
               srt_lines.append(str(idx))
               srt_lines.append(f"{srt_ts(start)} --> {srt_ts(end)}")
               srt_lines.append(text)
               srt_lines.append("")
               idx += 1
 
-              # karaoke per word
-              words = []
-              if getattr(seg, "words", None):
-                  words = seg.words
-
+              # ASS karaoke per word
+              words = getattr(seg, "words", None) or []
               if not words:
-                  # fallback: show plain text
-                  ass_text = text.replace("{", "(").replace("}", ")")
-                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{ass_text}")
+                  safe = text.replace("{", "(").replace("}", ")")
+                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{safe}")
                   continue
 
-              # build \k tags in centiseconds
               parts = []
               for w in words:
                   ws = float(w.start); we = float(w.end)
@@ -180,8 +192,8 @@ jobs:
                   parts.append(rf"{{\k{dur_cs}}}{token}")
 
               if not parts:
-                  ass_text = text.replace("{", "(").replace("}", ")")
-                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{ass_text}")
+                  safe = text.replace("{", "(").replace("}", ")")
+                  ass_lines.append(f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Default,,0,0,0,,{safe}")
                   continue
 
               ass_text = " ".join(parts)
@@ -199,14 +211,15 @@ jobs:
           python3 make_subs.py
           ls -lh subs.srt subs.ass
 
-      - name: Burn ASS subtitles into video (vertical 1080x1920)
+      - name: Burn ASS subtitles into video
+        shell: bash
         run: |
-          # If your video is already correct size, it will just overlay.
-          # If you need to enforce size, uncomment scale/pad filter.
-          ffmpeg -y -i video.mp4 -vf "ass=subs.ass" -c:a copy out_subbed.mp4
+          set -euo pipefail
+          ffmpeg -y -i video.mp4 -vf "ass=subs.ass" -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k out_subbed.mp4
           ls -lh out_subbed.mp4
 
       - name: Upload results to R2
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -215,8 +228,16 @@ jobs:
           BUCKET: ${{ github.event.client_payload.bucket }}
           VIDEO_ID: ${{ github.event.client_payload.video_id }}
         run: |
-          set -e
-          if [ -z "$VIDEO_ID" ]; then VIDEO_ID="unknown"; fi
+          set -euo pipefail
+
+          if [ -z "${BUCKET:-}" ]; then
+            echo "Missing bucket in payload"
+            exit 1
+          fi
+
+          if [ -z "${VIDEO_ID:-}" ]; then
+            VIDEO_ID="$(date +%s)_$RANDOM"
+          fi
 
           aws --endpoint-url "$R2_ENDPOINT" s3 cp ./subs.srt "s3://$BUCKET/subs/${VIDEO_ID}.srt"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp ./subs.ass "s3://$BUCKET/subs/${VIDEO_ID}.ass"
@@ -226,3 +247,4 @@ jobs:
           echo "subs/${VIDEO_ID}.srt"
           echo "subs/${VIDEO_ID}.ass"
           echo "final/${VIDEO_ID}_subbed.mp4"
+
