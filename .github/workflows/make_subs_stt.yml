@@ -46,7 +46,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          BUCKET: ${{ github.event.client_payload.bucket }}
+          BUCKET: ${{ secrets.R2_BUCKET }}
           VIDEO_KEY: ${{ github.event.client_payload.video_key }}
           AUDIO_KEY: ${{ github.event.client_payload.audio_key }}
         run: |
@@ -225,7 +225,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          BUCKET: ${{ github.event.client_payload.bucket }}
+          BUCKET: ${{ secrets.R2_BUCKET }}
           VIDEO_ID: ${{ github.event.client_payload.video_id }}
         run: |
           set -euo pipefail
