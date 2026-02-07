@@ -39,7 +39,7 @@ jobs:
           echo "Triggered payload:"
           echo '${{ toJson(github.event.client_payload) }}'
 
-      - name: Download inputs from R2
+      - name: Download inputs from R2 (with debug ls)
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -56,6 +56,15 @@ jobs:
             echo "Missing R2_BUCKET secret"
             exit 1
           fi
+
+          echo "==== DEBUG: list bucket root (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/" | head -n 100 || true
+
+          echo "==== DEBUG: list videos/ (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/videos/" | head -n 100 || true
+
+          echo "==== DEBUG: list audios/ (first 100) ===="
+          aws --endpoint-url "$R2_ENDPOINT" s3 ls "s3://$BUCKET/audios/" | head -n 100 || true
 
           if [ -z "${VIDEO_KEY:-}" ]; then
             echo "Missing video_key in payload"
@@ -75,6 +84,7 @@ jobs:
             ffmpeg -y -i ./video.mp4 -vn -ac 1 -ar 16000 -f wav ./audio.wav
           fi
 
+          echo "Downloaded files:"
           ls -lh
 
       - name: Install faster-whisper
@@ -112,6 +122,9 @@ jobs:
               word_timestamps=True
           )
 
+          # IMPORTANT: segments is a generator -> convert once
+          segments = list(segments)
+
           def srt_ts(t: float) -> str:
               if t < 0: t = 0
               ms = int(round(t * 1000.0))
@@ -131,7 +144,7 @@ jobs:
           def clean_text(s: str) -> str:
               return re.sub(r"\s+", " ", (s or "")).strip()
 
-          # ---------- SRT (по сегментам, как раньше) ----------
+          # ---- SRT by segments ----
           srt_lines = []
           idx = 1
           for seg in segments:
@@ -149,7 +162,7 @@ jobs:
           with open(OUT_SRT, "w", encoding="utf-8") as f:
               f.write("\n".join(srt_lines))
 
-          # ---------- ASS (ОДНО СЛОВО ПО ЦЕНТРУ) ----------
+          # ---- ASS: one word centered ----
           ass_header = r"""[Script Info]
           ScriptType: v4.00+
           PlayResX: 1080
@@ -159,7 +172,6 @@ jobs:
 
           [V4+ Styles]
           Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          ; Alignment=5 -> центр экрана
           Style: Word,Arial,120,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,10,2,5,0,0,0,1
 
           [Events]
@@ -179,11 +191,8 @@ jobs:
                   if end <= start:
                       end = start + 0.06
 
-                  # ASS safety
                   token = token.replace("{", "(").replace("}", ")")
-
-                  # Жёстко по центру (можешь убрать, но так стабильнее)
-                  token = r"{\pos(540,960)}" + token
+                  token = r"{\pos(540,960)}" + token  # hard center
 
                   ass_lines.append(
                       f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{token}"
@@ -193,9 +202,11 @@ jobs:
               f.write("\n".join(ass_lines))
 
           print("Wrote:", OUT_SRT, OUT_ASS)
+          print("ASS lines:", len(ass_lines))
           PY
 
           python3 make_subs.py
+          wc -l subs.ass
           ls -lh subs.srt subs.ass
 
       - name: Burn ASS subtitles into video
