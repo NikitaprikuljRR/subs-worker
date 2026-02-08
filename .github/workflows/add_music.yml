@@ -1,0 +1,88 @@
+name: Add music to final video
+
+on:
+  repository_dispatch:
+    types: [add_music]
+
+jobs:
+  add_music:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
+          sudo dpkg --configure -a || true
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends ffmpeg
+
+      - name: Download final video + music from R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+          VIDEO_ID: ${{ github.event.client_payload.video_id }}
+          VIDEO_KEY: ${{ github.event.client_payload.video_key }}
+          MUSIC_KEY: ${{ github.event.client_payload.music_key }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BUCKET:-}" ]; then echo "Missing R2_BUCKET secret"; exit 1; fi
+          if [ -z "${VIDEO_KEY:-}" ]; then echo "Missing video_key in payload"; exit 1; fi
+          if [ -z "${MUSIC_KEY:-}" ]; then echo "Missing music_key in payload"; exit 1; fi
+
+          echo "Downloading video: s3://$BUCKET/$VIDEO_KEY"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$VIDEO_KEY" ./in.mp4
+
+          echo "Downloading music: s3://$BUCKET/$MUSIC_KEY"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$MUSIC_KEY" ./music_in
+
+          ls -lh
+
+      - name: Mix music (loop) + keep original audio
+        shell: bash
+        env:
+          VIDEO_ID: ${{ github.event.client_payload.video_id }}
+        run: |
+          set -euo pipefail
+
+          ffmpeg -y \
+            -i in.mp4 \
+            -stream_loop -1 -i music_in \
+            -filter_complex "\
+              [1:a]aformat=fltp:44100:stereo,volume=0.12[music]; \
+              [0:a]aformat=fltp:44100:stereo,volume=1.0[orig]; \
+              [music][orig]sidechaincompress=threshold=0.06:ratio=10:attack=10:release=2000[ducked]; \
+              [orig][ducked]amix=inputs=2:normalize=0[aout] \
+            " \
+            -map 0:v -map "[aout]" \
+            -c:v copy -c:a aac -b:a 192k \
+            -shortest out_music.mp4
+
+          ls -lh out_music.mp4
+
+      - name: Upload back to R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+          VIDEO_ID: ${{ github.event.client_payload.video_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VIDEO_ID:-}" ]; then
+            VIDEO_ID="$(date +%s)_$RANDOM"
+          fi
+
+          OUT_KEY="final/${VIDEO_ID}_subbed_music.mp4"
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp ./out_music.mp4 "s3://$BUCKET/$OUT_KEY"
+          echo "Uploaded: $OUT_KEY"
