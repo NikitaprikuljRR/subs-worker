@@ -25,7 +25,19 @@ jobs:
             ffmpeg \
             python3 python3-pip \
             jq \
-            fonts-noto-core fonts-dejavu-core fonts-liberation
+            fonts-noto-core fonts-dejavu-core fonts-liberation fonts-freefont-ttf \
+            fontconfig curl unzip
+
+      - name: Install meme/cartoon fonts (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # optional packages (may not exist on some mirrors) -> don't fail the job
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+            fonts-luckiest-guy fonts-bangers || true
+          fc-cache -f || true
+          echo "Fonts check:"
+          fc-list | grep -i -E "luckiest|bangers" || true
 
       - name: Setup env
         shell: bash
@@ -95,12 +107,14 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install faster-whisper==1.0.3
 
-      - name: Transcribe + build SRT + ASS (YT SHORTS POP, ONE WORD CENTER)
+      - name: Transcribe + build SRT + ASS (SHORTS FONT + 1 COLOR PER VIDEO + THIN COLOR OUTLINE)
         shell: bash
         env:
           LANG_CODE: en
           WHISPER_MODEL: small
           OUTLINE_MODE: random   # random | green
+          FONT_NAME: Luckiest Guy # try: Luckiest Guy | Bangers | DejaVu Sans | Liberation Sans
+          FONT_SIZE: "160"
         run: |
           set -euo pipefail
 
@@ -115,6 +129,8 @@ jobs:
           lang = os.environ.get("LANG_CODE", "en")
           model_name = os.environ.get("WHISPER_MODEL", "small")
           outline_mode = os.environ.get("OUTLINE_MODE", "random")  # random | green
+          font_name = os.environ.get("FONT_NAME", "Luckiest Guy")
+          font_size = int(os.environ.get("FONT_SIZE", "160"))
 
           model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
@@ -124,8 +140,7 @@ jobs:
               vad_filter=True,
               word_timestamps=True
           )
-
-          segments = list(segments)  # generator -> list
+          segments = list(segments)
 
           def srt_ts(t: float) -> str:
               if t < 0: t = 0
@@ -150,6 +165,7 @@ jobs:
               # ASS wants BGR: &HBBGGRR&
               return f"&H{b:02X}{g:02X}{r:02X}&"
 
+          # --- one color per VIDEO ---
           OUTLINE_PRESET = [
               (0, 255, 0),      # green
               (0, 200, 255),    # cyan
@@ -158,11 +174,15 @@ jobs:
               (255, 120, 0),    # orange
           ]
 
-          def pick_outline_color(mode="random") -> str:
+          def pick_video_outline_color(mode="random") -> str:
               if mode == "green":
                   return rgb_to_ass_bgr_hex(0, 255, 0)
               r, g, b = random.choice(OUTLINE_PRESET)
               return rgb_to_ass_bgr_hex(r, g, b)
+
+          VIDEO_OUTLINE = pick_video_outline_color(outline_mode)
+          print("VIDEO_OUTLINE:", VIDEO_OUTLINE, "mode:", outline_mode)
+          print("FONT:", font_name, "SIZE:", font_size)
 
           # ---- SRT by segments ----
           srt_lines = []
@@ -182,9 +202,11 @@ jobs:
           with open(OUT_SRT, "w", encoding="utf-8") as f:
               f.write("\n".join(srt_lines))
 
-          # ---- ASS: one word centered + YT Shorts pop ----
-          # Fonts installed: Noto Sans / DejaVu Sans / Liberation Sans
-          ass_header = r"""[Script Info]
+          # ---- ASS: 2 layers per word (black readable + thin colored outline) ----
+          # Layer 0: strong black outline for readability (like your screenshot)
+          # Layer 1: very thin colored outline (barely visible), 1 color per video
+
+          ass_header = f"""[Script Info]
           ScriptType: v4.00+
           PlayResX: 1080
           PlayResY: 1920
@@ -193,7 +215,7 @@ jobs:
 
           [V4+ Styles]
           Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          Style: Word,Noto Sans,120,&H00FFFFFF,&H00FFFFFF,&H0000FF00,&H00000000,1,0,0,0,100,100,0,0,1,10,0,5,0,0,0,1
+          Style: Word,{font_name},{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,8,0,5,0,0,0,1
 
           [Events]
           Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -220,39 +242,52 @@ jobs:
 
                   token = token.replace("{", "(").replace("}", ")")
 
-                  ol = pick_outline_color(outline_mode)
-
-                  # Center immediately + pop animation
-                  override = (
+                  # POP: center immediately (YT Shorts)
+                  pop = (
                       r"{"
                       r"\an5"
                       r"\pos(540,960)"
-
-                      # start: bigger, a bit blurry, almost transparent
                       r"\fscx170\fscy170"
-                      r"\blur2.2"
+                      r"\blur2.0"
                       r"\alpha&HCC&"
-
-                      # snap to 110% quickly + sharpen + full opacity
-                      r"\t(0,90,\fscx110\fscy110\blur0.6\alpha&H00&)"
-
-                      # settle to 100% (tiny bounce)
+                      r"\t(0,90,\fscx110\fscy110\blur0.5\alpha&H00&)"
                       r"\t(90,150,\fscx100\fscy100\blur0.0)"
-
-                      # outline + colors
-                      r"\bord10"
-                      rf"\3c{ol}"
-                      r"\1c&H00FFFFFF&"
-
-                      # subtle shadow
-                      r"\shad4\4c&H000000&"
                       r"}"
                   )
 
-                  text = override + token
+                  text_base = pop + token
+
+                  # Layer 0: black outline (readable)
+                  base_override = (
+                      r"{"
+                      r"\an5\pos(540,960)"
+                      r"\bord8"
+                      r"\3c&H000000&"
+                      r"\1c&H00FFFFFF&"
+                      r"\shad3\4c&H000000&"
+                      r"}"
+                  )
+                  base_text = base_override + text_base
+
+                  # Layer 1: THIN colored outline, barely visible
+                  # \3a sets OUTLINE alpha (higher = more transparent). &H70& ~ subtle.
+                  color_override = (
+                      r"{"
+                      r"\an5\pos(540,960)"
+                      r"\bord2"
+                      rf"\3c{VIDEO_OUTLINE}"
+                      r"\3a&H70&"
+                      r"\1c&H00FFFFFF&"
+                      r"\shad0"
+                      r"}"
+                  )
+                  color_text = color_override + text_base
 
                   ass_lines.append(
-                      f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{text}"
+                      f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{base_text}"
+                  )
+                  ass_lines.append(
+                      f"Dialogue: 1,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{color_text}"
                   )
 
           with open(OUT_ASS, "w", encoding="utf-8") as f:
