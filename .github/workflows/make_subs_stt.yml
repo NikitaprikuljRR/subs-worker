@@ -24,7 +24,8 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             ffmpeg \
             python3 python3-pip \
-            jq
+            jq \
+            fonts-montserrat fonts-noto-core
 
       - name: Setup env
         shell: bash
@@ -94,16 +95,17 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install faster-whisper==1.0.3
 
-      - name: Transcribe + build SRT + ASS (ONE WORD CENTER)
+      - name: Transcribe + build SRT + ASS (YT SHORTS POP, ONE WORD CENTER)
         shell: bash
         env:
           LANG_CODE: en
           WHISPER_MODEL: small
+          OUTLINE_MODE: random   # random | green
         run: |
           set -euo pipefail
 
           cat > make_subs.py <<'PY'
-          import os, re
+          import os, re, random
           from faster_whisper import WhisperModel
 
           AUDIO = "audio.wav"
@@ -112,6 +114,7 @@ jobs:
 
           lang = os.environ.get("LANG_CODE", "en")
           model_name = os.environ.get("WHISPER_MODEL", "small")
+          outline_mode = os.environ.get("OUTLINE_MODE", "random")  # random | green
 
           model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
@@ -144,6 +147,24 @@ jobs:
           def clean_text(s: str) -> str:
               return re.sub(r"\s+", " ", (s or "")).strip()
 
+          def rgb_to_ass_bgr_hex(r:int, g:int, b:int) -> str:
+              # ASS wants BGR: &HBBGGRR&
+              return f"&H{b:02X}{g:02X}{r:02X}&"
+
+          OUTLINE_PRESET = [
+              (0, 255, 0),      # green
+              (0, 200, 255),    # cyan
+              (255, 0, 255),    # magenta
+              (255, 255, 0),    # yellow
+              (255, 120, 0),    # orange
+          ]
+
+          def pick_outline_color(mode="random") -> str:
+              if mode == "green":
+                  return rgb_to_ass_bgr_hex(0, 255, 0)
+              r,g,b = random.choice(OUTLINE_PRESET)
+              return rgb_to_ass_bgr_hex(r,g,b)
+
           # ---- SRT by segments ----
           srt_lines = []
           idx = 1
@@ -162,7 +183,8 @@ jobs:
           with open(OUT_SRT, "w", encoding="utf-8") as f:
               f.write("\n".join(srt_lines))
 
-          # ---- ASS: one word centered ----
+          # ---- ASS: one word centered + YT Shorts pop ----
+          # If Montserrat isn't available, change Fontname to "Noto Sans"
           ass_header = r"""[Script Info]
           ScriptType: v4.00+
           PlayResX: 1080
@@ -172,7 +194,7 @@ jobs:
 
           [V4+ Styles]
           Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          Style: Word,Arial,120,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,10,2,5,0,0,0,1
+          Style: Word,Montserrat,120,&H00FFFFFF,&H00FFFFFF,&H0000FF00,&H00000000,1,0,0,0,100,100,0,0,1,10,0,5,0,0,0,1
 
           [Events]
           Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -186,16 +208,47 @@ jobs:
                   token = (w.word or "").strip()
                   if not token:
                       continue
+
                   start = float(w.start)
                   end = float(w.end)
-                  if end <= start:
-                      end = start + 0.06
 
+                  # Avoid micro-blinks
+                  min_dur = 0.12
+                  pad_end = 0.04
+                  if end - start < min_dur:
+                      end = start + min_dur
+                  end += pad_end
+
+                  # Sanitize ASS braces
                   token = token.replace("{", "(").replace("}", ")")
-                  token = r"{\pos(540,960)}" + token  # hard center
+
+                  ol = pick_outline_color(outline_mode)
+
+                  # Center immediately + "pop" (scale+blur+alpha -> settle)
+                  override = (
+                      r"{"
+                      r"\an5"
+                      r"\pos(540,960)"
+
+                      r"\fscx170\fscy170"
+                      r"\blur2.2"
+                      r"\alpha&HCC&"
+
+                      r"\t(0,90,\fscx110\fscy110\blur0.6\alpha&H00&)"
+                      r"\t(90,150,\fscx100\fscy100\blur0.0)"
+
+                      r"\bord10"
+                      rf"\3c{ol}"
+                      r"\1c&H00FFFFFF&"
+
+                      r"\shad4\4c&H000000&"
+                      r"}"
+                  )
+
+                  text = override + token
 
                   ass_lines.append(
-                      f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{token}"
+                      f"Dialogue: 0,{ass_ts(start)},{ass_ts(end)},Word,,0,0,0,,{text}"
                   )
 
           with open(OUT_ASS, "w", encoding="utf-8") as f:
