@@ -25,7 +25,7 @@ jobs:
             ffmpeg \
             python3 python3-pip \
             jq \
-            fonts-montserrat fonts-noto-core
+            fonts-noto-core fonts-dejavu-core fonts-liberation
 
       - name: Setup env
         shell: bash
@@ -125,8 +125,7 @@ jobs:
               word_timestamps=True
           )
 
-          # IMPORTANT: segments is a generator -> convert once
-          segments = list(segments)
+          segments = list(segments)  # generator -> list
 
           def srt_ts(t: float) -> str:
               if t < 0: t = 0
@@ -162,8 +161,8 @@ jobs:
           def pick_outline_color(mode="random") -> str:
               if mode == "green":
                   return rgb_to_ass_bgr_hex(0, 255, 0)
-              r,g,b = random.choice(OUTLINE_PRESET)
-              return rgb_to_ass_bgr_hex(r,g,b)
+              r, g, b = random.choice(OUTLINE_PRESET)
+              return rgb_to_ass_bgr_hex(r, g, b)
 
           # ---- SRT by segments ----
           srt_lines = []
@@ -184,7 +183,7 @@ jobs:
               f.write("\n".join(srt_lines))
 
           # ---- ASS: one word centered + YT Shorts pop ----
-          # If Montserrat isn't available, change Fontname to "Noto Sans"
+          # Fonts installed: Noto Sans / DejaVu Sans / Liberation Sans
           ass_header = r"""[Script Info]
           ScriptType: v4.00+
           PlayResX: 1080
@@ -194,7 +193,7 @@ jobs:
 
           [V4+ Styles]
           Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          Style: Word,Montserrat,120,&H00FFFFFF,&H00FFFFFF,&H0000FF00,&H00000000,1,0,0,0,100,100,0,0,1,10,0,5,0,0,0,1
+          Style: Word,Noto Sans,120,&H00FFFFFF,&H00FFFFFF,&H0000FF00,&H00000000,1,0,0,0,100,100,0,0,1,10,0,5,0,0,0,1
 
           [Events]
           Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -212,35 +211,40 @@ jobs:
                   start = float(w.start)
                   end = float(w.end)
 
-                  # Avoid micro-blinks
+                  # avoid micro-blinks
                   min_dur = 0.12
                   pad_end = 0.04
                   if end - start < min_dur:
                       end = start + min_dur
                   end += pad_end
 
-                  # Sanitize ASS braces
                   token = token.replace("{", "(").replace("}", ")")
 
                   ol = pick_outline_color(outline_mode)
 
-                  # Center immediately + "pop" (scale+blur+alpha -> settle)
+                  # Center immediately + pop animation
                   override = (
                       r"{"
                       r"\an5"
                       r"\pos(540,960)"
 
+                      # start: bigger, a bit blurry, almost transparent
                       r"\fscx170\fscy170"
                       r"\blur2.2"
                       r"\alpha&HCC&"
 
+                      # snap to 110% quickly + sharpen + full opacity
                       r"\t(0,90,\fscx110\fscy110\blur0.6\alpha&H00&)"
+
+                      # settle to 100% (tiny bounce)
                       r"\t(90,150,\fscx100\fscy100\blur0.0)"
 
+                      # outline + colors
                       r"\bord10"
                       rf"\3c{ol}"
                       r"\1c&H00FFFFFF&"
 
+                      # subtle shadow
                       r"\shad4\4c&H000000&"
                       r"}"
                   )
