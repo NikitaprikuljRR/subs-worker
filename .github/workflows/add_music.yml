@@ -104,7 +104,7 @@ jobs:
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex "[1:a]aformat=fltp:44100:stereo,volume=0.12[aout]" \
+              -filter_complex "[1:a]aformat=fltp:44100:stereo,volume=0.2[aout]" \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
@@ -113,7 +113,7 @@ jobs:
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex "[0:a]aformat=fltp:44100:stereo,volume=1.0[orig];[1:a]aformat=fltp:44100:stereo,volume=0.12[mus];[orig][mus]amix=inputs=2:normalize=0[aout]" \
+              -filter_complex "[0:a]aformat=fltp:44100:stereo,volume=1.0[orig];[1:a]aformat=fltp:44100:stereo,volume=0.2[mus];[orig][mus]amix=inputs=2:normalize=0[aout]" \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
