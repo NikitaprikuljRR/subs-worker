@@ -3,6 +3,20 @@ name: Add music to final video
 on:
   repository_dispatch:
     types: [add_music]
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "Video id (used in output filename)"
+        required: true
+        default: "123"
+      video_key:
+        description: "R2 key of input video (with subtitles), e.g. final/123_subbed.mp4"
+        required: true
+        default: "final/123_subbed.mp4"
+      music_key:
+        description: "R2 key of music file, e.g. music.mp3 or music/music.mp3"
+        required: true
+        default: "music.mp3"
 
 jobs:
   add_music:
@@ -23,6 +37,30 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -n 2
 
+      - name: Resolve inputs (dispatch vs manual)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # If repository_dispatch: values are in github.event.client_payload.*
+          # If workflow_dispatch: values are in github.event.inputs.*
+          VIDEO_ID="${{ github.event.client_payload.video_id || github.event.inputs.video_id }}"
+          VIDEO_KEY="${{ github.event.client_payload.video_key || github.event.inputs.video_key }}"
+          MUSIC_KEY="${{ github.event.client_payload.music_key || github.event.inputs.music_key }}"
+
+          echo "VIDEO_ID=$VIDEO_ID" >> $GITHUB_ENV
+          echo "VIDEO_KEY=$VIDEO_KEY" >> $GITHUB_ENV
+          echo "MUSIC_KEY=$MUSIC_KEY" >> $GITHUB_ENV
+
+          echo "---- DEBUG event ----"
+          echo "event_name=${{ github.event_name }}"
+          echo "client_payload=${{ toJson(github.event.client_payload) }}"
+          echo "inputs=${{ toJson(github.event.inputs) }}"
+          echo "---- RESOLVED ----"
+          echo "VIDEO_ID=$VIDEO_ID"
+          echo "VIDEO_KEY=$VIDEO_KEY"
+          echo "MUSIC_KEY=$MUSIC_KEY"
+
       - name: Download final video + music from R2
         shell: bash
         env:
@@ -31,13 +69,14 @@ jobs:
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
-          VIDEO_KEY: ${{ github.event.client_payload.video_key }}
-          MUSIC_KEY: ${{ github.event.client_payload.music_key }}
+          VIDEO_KEY: ${{ env.VIDEO_KEY }}
+          MUSIC_KEY: ${{ env.MUSIC_KEY }}
         run: |
           set -euo pipefail
+
           if [ -z "${BUCKET:-}" ]; then echo "Missing secret: R2_BUCKET"; exit 1; fi
-          if [ -z "${VIDEO_KEY:-}" ]; then echo "Missing payload: video_key"; exit 1; fi
-          if [ -z "${MUSIC_KEY:-}" ]; then echo "Missing payload: music_key"; exit 1; fi
+          if [ -z "${VIDEO_KEY:-}" ]; then echo "Missing VIDEO_KEY (payload/inputs)"; exit 1; fi
+          if [ -z "${MUSIC_KEY:-}" ]; then echo "Missing MUSIC_KEY (payload/inputs)"; exit 1; fi
 
           echo "Downloading video: s3://$BUCKET/$VIDEO_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$VIDEO_KEY" ./in.mp4
@@ -45,46 +84,32 @@ jobs:
           echo "Downloading music: s3://$BUCKET/$MUSIC_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$MUSIC_KEY" ./music_in
 
+          echo "Files:"
           ls -lh
 
-      - name: Mix music (loop) + duck under original audio
+      - name: Mix music (loop) + keep original audio (SAFE)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Проверим, есть ли аудио в исходном видео
           HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 in.mp4 || true)
           echo "HAS_AUDIO=$HAS_AUDIO"
 
           if [ -z "$HAS_AUDIO" ]; then
-            echo "No audio track in video -> music only"
-
-            cat > graph.txt <<'EOF'
-[1:a]aformat=fltp:44100:stereo,volume=0.12[aout]
-EOF
-
+            echo "No audio in in.mp4 -> music only"
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex_script graph.txt \
+              -filter_complex "[1:a]aformat=fltp:44100:stereo,volume=0.12[aout]" \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
-
           else
-            echo "Audio track exists -> duck music under voice"
-
-            cat > graph.txt <<'EOF'
-[0:a]aformat=fltp:44100:stereo,volume=1.0[voice]
-[1:a]aformat=fltp:44100:stereo,volume=0.12[music]
-[music][voice]sidechaincompress=threshold=0.06:ratio=10:attack=10:release=2000[musicduck]
-[voice][musicduck]amix=inputs=2:normalize=0[aout]
-EOF
-
+            echo "Audio exists -> mix original + music"
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex_script graph.txt \
+              -filter_complex "[0:a]aformat=fltp:44100:stereo,volume=1.0[orig];[1:a]aformat=fltp:44100:stereo,volume=0.12[mus];[orig][mus]amix=inputs=2:normalize=0[aout]" \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
@@ -100,15 +125,14 @@ EOF
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
-          VIDEO_ID: ${{ github.event.client_payload.video_id }}
+          VIDEO_ID: ${{ env.VIDEO_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${BUCKET:-}" ]; then echo "Missing secret: R2_BUCKET"; exit 1; fi
 
-          if [ -z "${VIDEO_ID:-}" ]; then
-            VIDEO_ID="$(date +%s)_$RANDOM"
-          fi
+          if [ -z "${BUCKET:-}" ]; then echo "Missing secret: R2_BUCKET"; exit 1; fi
+          if [ -z "${VIDEO_ID:-}" ]; then VIDEO_ID="$(date +%s)_$RANDOM"; fi
 
           OUT_KEY="final/${VIDEO_ID}_subbed_music.mp4"
+          echo "Uploading: s3://$BUCKET/$OUT_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp ./out_music.mp4 "s3://$BUCKET/$OUT_KEY"
           echo "Uploaded: $OUT_KEY"
