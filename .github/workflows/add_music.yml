@@ -20,8 +20,7 @@ jobs:
           sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
           sudo dpkg --configure -a || true
           sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends ffmpeg python3 python3-pip
-          python3 -V
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends ffmpeg
           ffmpeg -version | head -n 2
 
       - name: Download final video + music from R2
@@ -32,20 +31,13 @@ jobs:
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
-
-          VIDEO_ID: ${{ github.event.client_payload.video_id }}
           VIDEO_KEY: ${{ github.event.client_payload.video_key }}
           MUSIC_KEY: ${{ github.event.client_payload.music_key }}
         run: |
           set -euo pipefail
-
           if [ -z "${BUCKET:-}" ]; then echo "Missing secret: R2_BUCKET"; exit 1; fi
           if [ -z "${VIDEO_KEY:-}" ]; then echo "Missing payload: video_key"; exit 1; fi
           if [ -z "${MUSIC_KEY:-}" ]; then echo "Missing payload: music_key"; exit 1; fi
-
-          echo "Bucket: $BUCKET"
-          echo "Video key: $VIDEO_KEY"
-          echo "Music key: $MUSIC_KEY"
 
           echo "Downloading video: s3://$BUCKET/$VIDEO_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$BUCKET/$VIDEO_KEY" ./in.mp4
@@ -55,35 +47,44 @@ jobs:
 
           ls -lh
 
-      - name: Mix music (loop) + keep original audio (ducking)
+      - name: Mix music (loop) + duck under original audio
         shell: bash
         run: |
           set -euo pipefail
 
-          # Если вдруг в видео нет аудио-стрима, сделаем микс только с музыкой.
+          # Проверим, есть ли аудио в исходном видео
           HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 in.mp4 || true)
           echo "HAS_AUDIO=$HAS_AUDIO"
 
           if [ -z "$HAS_AUDIO" ]; then
-            echo "No audio in in.mp4 -> using music only"
+            echo "No audio track in video -> music only"
+
+            cat > graph.txt <<'EOF'
+[1:a]aformat=fltp:44100:stereo,volume=0.12[aout]
+EOF
+
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex "[1:a]aformat=fltp:44100:stereo,volume=0.12[aout]" \
+              -filter_complex_script graph.txt \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
+
           else
-            echo "Audio exists -> duck music under original audio"
+            echo "Audio track exists -> duck music under voice"
+
+            cat > graph.txt <<'EOF'
+[0:a]aformat=fltp:44100:stereo,volume=1.0[voice]
+[1:a]aformat=fltp:44100:stereo,volume=0.12[music]
+[music][voice]sidechaincompress=threshold=0.06:ratio=10:attack=10:release=2000[musicduck]
+[voice][musicduck]amix=inputs=2:normalize=0[aout]
+EOF
+
             ffmpeg -y \
               -i in.mp4 \
               -stream_loop -1 -i music_in \
-              -filter_complex "
-                [0:a]aformat=fltp:44100:stereo,volume=1.0[voice];
-                [1:a]aformat=fltp:44100:stereo,volume=0.12[music];
-                [music][voice]sidechaincompress=threshold=0.06:ratio=10:attack=10:release=2000[musicduck];
-                [voice][musicduck]amix=inputs=2:normalize=0[aout]
-              " \
+              -filter_complex_script graph.txt \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
               -shortest out_music.mp4
@@ -102,7 +103,6 @@ jobs:
           VIDEO_ID: ${{ github.event.client_payload.video_id }}
         run: |
           set -euo pipefail
-
           if [ -z "${BUCKET:-}" ]; then echo "Missing secret: R2_BUCKET"; exit 1; fi
 
           if [ -z "${VIDEO_ID:-}" ]; then
@@ -110,6 +110,5 @@ jobs:
           fi
 
           OUT_KEY="final/${VIDEO_ID}_subbed_music.mp4"
-          echo "Uploading: $OUT_KEY"
           aws --endpoint-url "$R2_ENDPOINT" s3 cp ./out_music.mp4 "s3://$BUCKET/$OUT_KEY"
           echo "Uploaded: $OUT_KEY"
